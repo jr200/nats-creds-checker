@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -25,6 +29,7 @@ func main() {
 
 	rootCmd.AddCommand(validateCmd(log))
 	rootCmd.AddCommand(reportCmd(log))
+	rootCmd.AddCommand(serveCmd(log))
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -84,7 +89,7 @@ func reportCmd(log *zap.Logger) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "report",
-		Short: "Report NATS credential status, account health, and connection info",
+		Short: "Run a one-shot NATS credential and health report",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return report.Run(log, monitorURL, credsFile, tlsCA)
 		},
@@ -93,6 +98,53 @@ func reportCmd(log *zap.Logger) *cobra.Command {
 	cmd.Flags().StringVar(&monitorURL, "monitor-url", "", "NATS server monitor URL (e.g. http://localhost:8222)")
 	cmd.Flags().StringVar(&credsFile, "creds", "", "Path to system account .creds file for server ping")
 	cmd.Flags().StringVar(&tlsCA, "tls-ca", "", "Path to CA certificate for TLS verification")
+	_ = cmd.MarkFlagRequired("monitor-url")
+
+	return cmd
+}
+
+func serveCmd(log *zap.Logger) *cobra.Command {
+	var (
+		monitorURL string
+		credsFile  string
+		tlsCA      string
+		interval   time.Duration
+	)
+
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Run continuous NATS health monitoring",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			defer stop()
+
+			log.Info("starting continuous monitor",
+				zap.String("monitor_url", monitorURL),
+				zap.Duration("interval", interval),
+			)
+
+			// Run immediately on startup.
+			report.Run(log, monitorURL, credsFile, tlsCA)
+
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					log.Info("shutting down")
+					return nil
+				case <-ticker.C:
+					report.Run(log, monitorURL, credsFile, tlsCA)
+				}
+			}
+		},
+	}
+
+	cmd.Flags().StringVar(&monitorURL, "monitor-url", "", "NATS server monitor URL (e.g. http://localhost:8222)")
+	cmd.Flags().StringVar(&credsFile, "creds", "", "Path to system account .creds file for server ping")
+	cmd.Flags().StringVar(&tlsCA, "tls-ca", "", "Path to CA certificate for TLS verification")
+	cmd.Flags().DurationVar(&interval, "interval", 30*time.Second, "Check interval")
 	_ = cmd.MarkFlagRequired("monitor-url")
 
 	return cmd
